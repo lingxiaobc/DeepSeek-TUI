@@ -6,6 +6,7 @@ pub mod file;
 pub mod file_search;
 pub mod finance;
 
+pub mod fetch_url;
 pub mod git;
 pub mod git_history;
 pub mod parallel;

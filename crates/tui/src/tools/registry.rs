@@ -345,10 +345,12 @@ impl ToolRegistryBuilder {
     /// Include web search tools.
     #[must_use]
     pub fn with_web_tools(self) -> Self {
+        use super::fetch_url::FetchUrlTool;
         use super::finance::FinanceTool;
         use super::web_run::WebRunTool;
         use super::web_search::WebSearchTool;
         self.with_tool(Arc::new(WebSearchTool))
+            .with_tool(Arc::new(FetchUrlTool))
             .with_tool(Arc::new(FinanceTool::new()))
             .with_tool(Arc::new(WebRunTool))
     }
