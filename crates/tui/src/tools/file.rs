@@ -10,6 +10,8 @@ use super::spec::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::fs;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 // === ReadFileTool ===
 
@@ -23,7 +25,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace."
+        "Read a file from the workspace. Plain text is returned as-is; PDFs are auto-extracted via `pdftotext` (poppler) when available."
     }
 
     fn input_schema(&self) -> Value {
@@ -33,6 +35,10 @@ impl ToolSpec for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file (relative to workspace or absolute)"
+                },
+                "pages": {
+                    "type": "string",
+                    "description": "PDF only: page range to extract, e.g. \"1-5\" or \"10\". Ignored for non-PDF files."
                 }
             },
             "required": ["path"]
@@ -50,6 +56,11 @@ impl ToolSpec for ReadFileTool {
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let path_str = required_str(&input, "path")?;
         let file_path = context.resolve_path(path_str)?;
+        let pages = optional_str(&input, "pages");
+
+        if is_pdf(&file_path)? {
+            return read_pdf(&file_path, pages);
+        }
 
         let contents = fs::read_to_string(&file_path).map_err(|e| {
             ToolError::execution_failed(format!("Failed to read {}: {}", file_path.display(), e))
@@ -57,6 +68,114 @@ impl ToolSpec for ReadFileTool {
 
         Ok(ToolResult::success(contents))
     }
+}
+
+/// Detect a PDF by extension OR by sniffing the `%PDF-` magic bytes.
+/// Files without an extension are still recognized as PDFs when the header
+/// matches.
+fn is_pdf(path: &Path) -> Result<bool, ToolError> {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        return Ok(true);
+    }
+    // Sniff first 4 bytes. Don't error if the file doesn't exist — let the
+    // caller's `read_to_string` produce the canonical not-found error.
+    let mut buf = [0u8; 4];
+    let result = match fs::File::open(path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            f.read_exact(&mut buf).map(|_| buf)
+        }
+        Err(_) => return Ok(false),
+    };
+    Ok(matches!(result, Ok(b) if &b == b"%PDF"))
+}
+
+fn parse_pages_arg(spec: &str) -> Option<(u32, u32)> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = trimmed.split_once('-') {
+        let start: u32 = a.trim().parse().ok()?;
+        let end: u32 = b.trim().parse().ok()?;
+        if start == 0 || end < start {
+            return None;
+        }
+        Some((start, end))
+    } else {
+        let n: u32 = trimmed.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        Some((n, n))
+    }
+}
+
+fn read_pdf(path: &Path, pages: Option<&str>) -> Result<ToolResult, ToolError> {
+    // Try pdftotext (from the poppler suite). Other extractors (mutool,
+    // pdfminer) could be added later behind the same dispatch.
+    let mut cmd = Command::new("pdftotext");
+    cmd.arg("-layout");
+
+    if let Some(spec) = pages {
+        match parse_pages_arg(spec) {
+            Some((start, end)) => {
+                cmd.arg("-f").arg(start.to_string());
+                cmd.arg("-l").arg(end.to_string());
+            }
+            None => {
+                return Err(ToolError::invalid_input(format!(
+                    "invalid `pages` value `{spec}` (expected `N` or `N-M`, e.g. `1-5`)"
+                )));
+            }
+        }
+    }
+
+    cmd.arg(path).arg("-"); // output to stdout
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Structured "binary unavailable" — caller knows what to suggest.
+            return ToolResult::json(&json!({
+                "type": "binary_unavailable",
+                "path": path.display().to_string(),
+                "kind": "pdf",
+                "reason": "pdftotext not installed",
+                "hint": "install poppler (macOS: `brew install poppler`; Debian/Ubuntu: `apt install poppler-utils`)"
+            }))
+            .map_err(|e| {
+                ToolError::execution_failed(format!("failed to serialize response: {e}"))
+            });
+        }
+        Err(e) => {
+            return Err(ToolError::execution_failed(format!(
+                "failed to launch pdftotext: {e}"
+            )));
+        }
+    };
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| ToolError::execution_failed(format!("pdftotext failed to complete: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ToolError::execution_failed(format!(
+            "pdftotext failed (exit {:?}): {stderr}",
+            output.status.code()
+        )));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(ToolResult::success(text))
 }
 
 // === WriteFileTool ===
@@ -328,6 +447,69 @@ mod tests {
             err.to_string()
                 .contains("Failed to validate input: missing required field 'path'")
         );
+    }
+
+    #[test]
+    fn pdf_detected_by_extension() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("paper.PDF");
+        fs::write(&path, b"not really a pdf, but extension says yes").unwrap();
+        assert!(is_pdf(&path).unwrap());
+    }
+
+    #[test]
+    fn pdf_detected_by_magic_bytes_without_extension() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("blob");
+        fs::write(&path, b"%PDF-1.7\nrest of bytes").unwrap();
+        assert!(is_pdf(&path).unwrap());
+    }
+
+    #[test]
+    fn non_pdf_not_detected() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("notes.txt");
+        fs::write(&path, "hello").unwrap();
+        assert!(!is_pdf(&path).unwrap());
+    }
+
+    #[test]
+    fn pages_arg_parses_single_and_range() {
+        assert_eq!(parse_pages_arg("5"), Some((5, 5)));
+        assert_eq!(parse_pages_arg("1-10"), Some((1, 10)));
+        assert_eq!(parse_pages_arg(" 3 - 7 "), Some((3, 7)));
+        assert_eq!(parse_pages_arg("0"), None);
+        assert_eq!(parse_pages_arg("10-3"), None);
+        assert_eq!(parse_pages_arg(""), None);
+        assert_eq!(parse_pages_arg("abc"), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_binary_unavailable_when_pdftotext_missing() {
+        // We can't reliably remove pdftotext from $PATH in a test, but if
+        // it's missing on the runner this test exercises that branch. If
+        // it's installed, the test exits early — covered by the parse_pages
+        // and is_pdf tests above.
+        if Command::new("pdftotext")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("doc.pdf");
+        fs::write(&path, b"%PDF-1.7\n%%EOF").unwrap();
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let result = ReadFileTool
+            .execute(json!({"path": "doc.pdf"}), &ctx)
+            .await
+            .expect("structured response, not error");
+        assert!(result.success);
+        assert!(result.content.contains("binary_unavailable"));
+        assert!(result.content.contains("pdftotext"));
     }
 
     #[tokio::test]
