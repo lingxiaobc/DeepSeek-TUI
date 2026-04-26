@@ -68,7 +68,7 @@ fn redact_body_preview(body: &str) -> String {
 
 /// Read up to `max_bytes` of a reqwest Response body and produce a single-line
 /// excerpt suitable for an error message. Best-effort — if the body can't be
-/// read, returns "<no body>".
+/// read, returns the literal string `<no body>`.
 async fn bounded_body_excerpt(response: reqwest::Response, max_bytes: usize) -> String {
     let body_text = response.text().await.unwrap_or_default();
     if body_text.is_empty() {
