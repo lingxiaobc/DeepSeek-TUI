@@ -1914,3 +1914,64 @@ fn truncate_line_to_width_respects_display_width_for_tiny_budgets() {
     assert!(trimmed_long.ends_with("..."));
     assert!(UnicodeWidthStr::width(trimmed_long.as_str()) <= 10);
 }
+
+/// Regression for #86. A recoverable engine error (stream stall, transient
+/// disconnect, retryable server hiccup) must NOT flip the session into
+/// offline mode. Until this fix the UI matched on `EngineEvent::Error {
+/// message, .. }` and unconditionally set `app.offline_mode = true`, so a
+/// long V4 thinking turn whose chunked stream got closed mid-flight ended
+/// the session in offline mode with the next typed message queued.
+#[test]
+fn recoverable_engine_error_does_not_enter_offline_mode() {
+    let mut app = create_test_app();
+    assert!(!app.offline_mode);
+
+    apply_engine_error_to_app(
+        &mut app,
+        "Stream stalled: no data received for 60s, closing stream".to_string(),
+        true,
+    );
+
+    assert!(
+        !app.offline_mode,
+        "recoverable error must keep the session online so the user can retry"
+    );
+    assert!(!app.is_loading);
+    let status = app
+        .status_message
+        .as_deref()
+        .expect("recoverable errors must set a status message");
+    assert!(
+        status.starts_with("Connection interrupted"),
+        "expected interrupt-style status, got {status:?}"
+    );
+}
+
+/// Hard failures (auth, billing, malformed request) DO need to flip offline
+/// mode so subsequent typed messages get queued instead of silently lost
+/// against a broken upstream.
+#[test]
+fn non_recoverable_engine_error_enters_offline_mode() {
+    let mut app = create_test_app();
+    assert!(!app.offline_mode);
+
+    apply_engine_error_to_app(
+        &mut app,
+        "Authentication failed: invalid API key".to_string(),
+        false,
+    );
+
+    assert!(
+        app.offline_mode,
+        "non-recoverable error must enter offline mode"
+    );
+    assert!(!app.is_loading);
+    let status = app
+        .status_message
+        .as_deref()
+        .expect("non-recoverable errors must set a status message");
+    assert!(
+        status.starts_with("Engine error"),
+        "expected engine-error status, got {status:?}"
+    );
+}

@@ -639,18 +639,11 @@ async fn run_event_loop(
                             queued_to_send = app.pop_queued_message();
                         }
                     }
-                    EngineEvent::Error { message, .. } => {
-                        app.streaming_state.reset();
-                        app.streaming_message_index = None;
-                        app.streaming_thinking_active_entry = None;
-                        app.add_message(HistoryCell::System {
-                            content: format!("Error: {message}"),
-                        });
-                        app.offline_mode = true;
-                        app.is_loading = false;
-                        app.status_message = Some(format!(
-                            "Engine error; queued messages stay pending: {message}"
-                        ));
+                    EngineEvent::Error {
+                        message,
+                        recoverable,
+                    } => {
+                        apply_engine_error_to_app(app, message, recoverable);
                     }
                     EngineEvent::Status { message } => {
                         app.status_message = Some(message);
@@ -1712,6 +1705,33 @@ fn queued_session_to_ui(msg: QueuedSessionMessage) -> QueuedMessage {
     QueuedMessage {
         display: msg.display,
         skill_instruction: msg.skill_instruction,
+    }
+}
+
+/// Translate an `EngineEvent::Error` into UI state updates.
+///
+/// `recoverable` is the engine's own classification: stream stalls, chunk
+/// timeouts, transient network errors, and rate-limit/server hiccups arrive
+/// with `recoverable = true` and must NOT flip the session into offline mode
+/// — the user can resend the turn and the underlying transport will retry.
+/// Hard failures (auth, billing, invalid request) arrive with
+/// `recoverable = false`; those flip offline mode so subsequent messages get
+/// queued instead of silently lost mid-flight.
+pub(crate) fn apply_engine_error_to_app(app: &mut App, message: String, recoverable: bool) {
+    app.streaming_state.reset();
+    app.streaming_message_index = None;
+    app.streaming_thinking_active_entry = None;
+    app.add_message(HistoryCell::System {
+        content: format!("Error: {message}"),
+    });
+    app.is_loading = false;
+    if recoverable {
+        app.status_message = Some(format!("Connection interrupted: {message}"));
+    } else {
+        app.offline_mode = true;
+        app.status_message = Some(format!(
+            "Engine error; queued messages stay pending: {message}"
+        ));
     }
 }
 
