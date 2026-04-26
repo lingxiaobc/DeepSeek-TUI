@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Sub-agents surface in the footer status strip.** When N > 0 sub-agents are in flight, the footer grows a "1 agent" / "N agents" chip in DeepSeek-sky color matching the model badge. Hides entirely at zero. (`footer_agents_chip` in `widgets/footer.rs`)
+- **`@`-mention popup is fully wired in the composer.** Previously only the App state fields existed (`mention_menu_selected`, `mention_menu_hidden`). The popup now renders below the input mirror-style with the slash menu, with `@`-prefixed entries; Up/Down navigates, Enter / Tab apply the selection, Esc hides until the next input edit. Mention takes precedence over slash because the positional check is stricter. (`visible_mention_menu_entries` + `apply_mention_menu_selection` in `file_mention.rs`)
+
 ### Fixed
 - **Tool-call cells no longer flash `<command>` / `<file>` placeholders.** The engine used to emit `ToolCallStarted` from `ContentBlockStart` with `input: {}` — before any `InputJsonDelta` had streamed in — which baked the placeholder into the cell at creation time. The emission is now deferred to `ContentBlockStop` and routed through `final_tool_input`, so the cell is created with the parsed args already in hand. (engine.rs `final_tool_input`; engine/tests.rs `final_tool_input_*`)
+- **`parse_invocation_count` flake.** Two `markdown_render` tests both read the global PARSE_INVOCATIONS atomic and raced when other tests called `parse()` in parallel. Switched the counter to `thread_local!<Cell<u64>>`, so each test thread sees only its own invocations. Tested 8 sequential full-suite runs: 8/8 green (was ~40% green).
 
 ### Changed
 - **Tool labels use progressive verbs.** "Read foo.rs" → "Reading foo.rs", "List X" → "Listing X", "Search pattern" → "Searching for `pattern`", "List files" → "Listing files". Past-tense labels read wrong while a tool is still in flight; the new forms match what the user actually sees.
 - **Long-running tools grow an elapsed badge.** From 3 s onward the `running` status segment becomes `running (3s)`, `running (4s)`, … so the user can tell a tool isn't stuck. The status-animation tick (360 ms) drives the redraw; below 3 s the badge stays hidden so quick reads/greps don't churn. (history.rs `running_status_label_with_elapsed`)
 - **Spinner pulse is twice as fast** — `TOOL_STATUS_SYMBOL_MS` 1800 ms → 720 ms per glyph (full 4-glyph heartbeat in ~2.88 s instead of ~7.2 s).
+- **`tools/subagent.rs` is now a folder module.** Tests live in `tools/subagent/tests.rs`; runtime + manager + tool implementations stay in `tools/subagent/mod.rs`. Public API unchanged. The runtime / tool-impl split was deferred — `SubAgentTask`, `run_subagent_task`, `build_allowed_tools`, the agent prompt constants, and `normalize_role_alias` are referenced from both layers and need a small API design pass before they cleanly separate.
+
+### Test hygiene
+- **5 regression tests pin auto-scroll churn contract.** `mark_history_updated` does not scroll; tool-cell handlers only `mark_history_updated`; `add_message` and `flush_active_cell` gate on `user_scrolled_during_stream`; the per-stream lock clears at TurnComplete and when the user returns to the live tail. (P2.4)
 
 ## [0.6.0] - 2026-04-25
 
